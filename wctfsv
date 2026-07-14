@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+import argparse
+import sys
+import warnings
+import json
+from urllib.parse import urlparse
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.columns import Columns
+from rich.text import Text
+
+warnings.filterwarnings("ignore")
+
+from solver import (
+    SQLiScanner,
+    XSSScanner,
+    DirectoryBruter,
+    SubdomainEnumerator,
+    HeaderAnalyzer,
+    SourceAnalyzer,
+    CookieAnalyzer,
+)
+
+console = Console()
+
+
+BANNER = """
+[bold cyan]
+ ███╗   ██╗███████╗██╗  ██╗██╗   ██╗███████╗
+ ████╗  ██║██╔════╝╚██╗██╔╝██║   ██║██╔════╝
+ ██╔██╗ ██║█████╗   ╚███╔╝ ██║   ██║███████╗
+ ██║╚██╗██║██╔══╝   ██╔██╗ ██║   ██║╚════██║
+ ██║ ╚████║███████╗██╔╝ ██╗╚██████╔╝███████║
+ ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚══════╝
+[/bold cyan]
+[bold white]Web CTF Solver - All-in-One Tool[/bold white]
+[dim]For educational and CTF purposes only[/dim]
+[dim]Created by op-h | https://github.com/op-h/wctfcv[/dim]
+"""
+
+
+def parse_headers(headers_list):
+    headers = {}
+    if headers_list:
+        for h in headers_list:
+            if ":" in h:
+                key, value = h.split(":", 1)
+                headers[key.strip()] = value.strip()
+    return headers
+
+
+def parse_cookies(cookie_list):
+    cookies = {}
+    if cookie_list:
+        for c in cookie_list:
+            if "=" in c:
+                key, value = c.split("=", 1)
+                cookies[key.strip()] = value.strip()
+    return cookies
+
+
+def parse_data(data_list):
+    data = {}
+    if data_list:
+        for d in data_list:
+            if "=" in d:
+                key, value = d.split("=", 1)
+                data[key.strip()] = value.strip()
+    return data
+
+
+def cmd_sqli(args):
+    headers = parse_headers(args.header)
+    cookies = parse_cookies(args.cookie)
+    data = parse_data(args.data)
+    method = "POST" if args.data else "GET"
+
+    scanner = SQLiScanner(
+        url=args.url,
+        method=method,
+        data=data,
+        headers=headers,
+        cookies=cookies,
+        timeout=args.timeout,
+    )
+    results = scanner.scan()
+    scanner.print_results(results)
+
+    if results["vulnerable"] and args.dump:
+        param = results["injectable_params"][0]
+        tables = scanner.dump_tables(param)
+        if tables:
+            console.print(f"\n[bold]Tables found:[/bold]")
+            for t in tables:
+                console.print(f"  [cyan]->[/cyan] {t}")
+
+            for table in tables[:3]:
+                columns = scanner.dump_columns(param, table)
+                if columns:
+                    console.print(f"\n[bold]Columns in {table}:[/bold] {', '.join(columns)}")
+                    data_rows = scanner.dump_data(param, table, columns[:3])
+                    if data_rows:
+                        console.print(f"[bold]Data:[/bold]")
+                        for row in data_rows[:5]:
+                            console.print(f"  {row}")
+
+    if results["vulnerable"] and args.exploit:
+        param = results["injectable_params"][0]
+        payload = args.exploit
+        resp = scanner._send(payload)
+        console.print(f"\n[bold]Exploit result:[/bold]")
+        console.print(f"Status: {resp.status_code}")
+        console.print(f"Length: {len(resp.text)}")
+        console.print(resp.text[:2000])
+
+
+def cmd_xss(args):
+    headers = parse_headers(args.header)
+    cookies = parse_cookies(args.cookie)
+    data = parse_data(args.data)
+    method = "POST" if args.data else "GET"
+
+    scanner = XSSScanner(
+        url=args.url,
+        param=args.param,
+        method=method,
+        data=data,
+        headers=headers,
+        cookies=cookies,
+        timeout=args.timeout,
+    )
+    results = scanner.scan()
+    scanner.print_results(results)
+
+    if args.payloads:
+        payloads = scanner.generate_payloads(args.filter)
+        console.print(f"\n[bold]Generated payloads ({len(payloads)}):[/bold]")
+        for i, payload in enumerate(payloads, 1):
+            console.print(f"  {i}. {payload}")
+
+    if results["vulnerable"] and args.exploit:
+        param = results["reflected"][0] if results["reflected"] else args.param
+        payload = args.exploit
+        resp = scanner._send(payload)
+        console.print(f"\n[bold]Exploit result:[/bold]")
+        console.print(f"Status: {resp.status_code}")
+        console.print(f"Length: {len(resp.text)}")
+
+
+def cmd_brute(args):
+    headers = parse_headers(args.header)
+    cookies = parse_cookies(args.cookie)
+
+    bruter = DirectoryBruter(
+        url=args.url,
+        wordlist=args.wordlist,
+        extensions=args.extensions.split(",") if args.extensions else None,
+        threads=args.threads,
+        timeout=args.timeout,
+        headers=headers,
+        cookies=cookies,
+    )
+
+    if args.paths:
+        paths = args.paths.split(",")
+        results = bruter.scan_custom(paths)
+    else:
+        results = bruter.scan()
+
+    if results:
+        bruter.print_results(results)
+    else:
+        console.print("[yellow]No paths found[/yellow]")
+
+    if args.json_output:
+        with open(args.json_output, "w") as f:
+            json.dump(results, f, indent=2)
+        console.print(f"\n[green]Results saved to {args.json_output}[/green]")
+
+
+def cmd_subdomains(args):
+    enumerator = SubdomainEnumerator(
+        domain=args.domain,
+        threads=args.threads,
+        timeout=args.timeout,
+        wordlist=args.wordlist,
+    )
+
+    results = enumerator.enumerate(http_check=not args.dns_only)
+
+    if args.crtsh:
+        crtsh_results = enumerator.enumerate_crtsh()
+        results.extend(crtsh_results)
+
+    if results:
+        enumerator.print_results(results)
+    else:
+        console.print("[yellow]No subdomains found[/yellow]")
+
+    if args.json_output:
+        with open(args.json_output, "w") as f:
+            json.dump(results, f, indent=2)
+        console.print(f"\n[green]Results saved to {args.json_output}[/green]")
+
+
+def cmd_headers(args):
+    analyzer = HeaderAnalyzer(
+        url=args.url,
+        timeout=args.timeout,
+    )
+    results = analyzer.analyze()
+    analyzer.print_results(results)
+
+    if args.json_output:
+        with open(args.json_output, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        console.print(f"\n[green]Results saved to {args.json_output}[/green]")
+
+
+def cmd_source(args):
+    headers = parse_headers(args.header)
+    cookies = parse_cookies(args.cookie)
+
+    analyzer = SourceAnalyzer(
+        url=args.url,
+        timeout=args.timeout,
+        headers=headers,
+        cookies=cookies,
+    )
+    results = analyzer.analyze()
+    analyzer.print_results(results)
+
+    if args.json_output:
+        with open(args.json_output, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        console.print(f"\n[green]Results saved to {args.json_output}[/green]")
+
+
+def cmd_cookies(args):
+    headers = parse_headers(args.header)
+
+    analyzer = CookieAnalyzer(
+        url=args.url,
+        timeout=args.timeout,
+        headers=headers,
+    )
+    results = analyzer.analyze()
+    analyzer.print_results(results)
+
+    if args.manipulate:
+        name, value = args.manipulate.split("=", 1)
+        payload = analyzer.manipulate_cookie(name, value)
+        console.print(f"\n[bold]Cookie manipulation:[/bold]")
+        console.print(f"  Set: {payload['name']}={payload['value']}")
+
+    if args.payloads and args.cookie_name:
+        payloads = analyzer.generate_payloads(args.cookie_name)
+
+    if args.json_output:
+        with open(args.json_output, "w") as f:
+            json.dump(results, f, indent=2, default=str)
+        console.print(f"\n[green]Results saved to {args.json_output}[/green]")
+
+
+def cmd_all(args):
+    console.print(BANNER)
+    console.print(f"[bold cyan]Running all modules against: {args.url}[/bold cyan]\n")
+
+    parsed = urlparse(args.url)
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+    console.print("=" * 60)
+    console.print("[bold]1. Header Analysis[/bold]")
+    console.print("=" * 60)
+    header_analyzer = HeaderAnalyzer(url=args.url, timeout=args.timeout)
+    header_results = header_analyzer.analyze()
+
+    console.print("\n" + "=" * 60)
+    console.print("[bold]2. Source Code Analysis[/bold]")
+    console.print("=" * 60)
+    headers = parse_headers(args.header)
+    cookies = parse_cookies(args.cookie)
+    source_analyzer = SourceAnalyzer(url=args.url, timeout=args.timeout, headers=headers, cookies=cookies)
+    source_results = source_analyzer.analyze()
+
+    console.print("\n" + "=" * 60)
+    console.print("[bold]3. Cookie Analysis[/bold]")
+    console.print("=" * 60)
+    cookie_analyzer = CookieAnalyzer(url=args.url, timeout=args.timeout, headers=headers)
+    cookie_results = cookie_analyzer.analyze()
+
+    console.print("\n" + "=" * 60)
+    console.print("[bold]4. SQL Injection Scan[/bold]")
+    console.print("=" * 60)
+    data = parse_data(args.data)
+    method = "POST" if args.data else "GET"
+    sqli_scanner = SQLiScanner(
+        url=args.url,
+        method=method,
+        data=data,
+        headers=headers,
+        cookies=cookies,
+        timeout=args.timeout,
+    )
+    sqli_results = sqli_scanner.scan()
+
+    console.print("\n" + "=" * 60)
+    console.print("[bold]5. Directory Brute-Force[/bold]")
+    console.print("=" * 60)
+    bruter = DirectoryBruter(
+        url=base_url,
+        threads=min(args.threads, 5),
+        timeout=args.timeout,
+        headers=headers,
+        cookies=cookies,
+    )
+    brute_results = bruter.scan()
+
+    console.print("\n" + "=" * 60)
+    console.print("[bold]6. Subdomain Enumeration[/bold]")
+    console.print("=" * 60)
+    domain = parsed.netloc.split(":")[0]
+    enumerator = SubdomainEnumerator(
+        domain=domain,
+        threads=min(args.threads, 5),
+        timeout=args.timeout,
+    )
+    sub_results = enumerator.enumerate(http_check=False)
+
+    console.print("\n" + "=" * 60)
+    console.print("[bold]Summary[/bold]")
+    console.print("=" * 60)
+
+    summary = Table(title="Scan Summary", border_style="cyan")
+    summary.add_column("Module", style="bold")
+    summary.add_column("Status")
+    summary.add_column("Findings")
+    summary.add_row("Headers", f"{len(header_results['missing_headers'])} missing", f"{len(header_results['security_issues'])} issues")
+    summary.add_row("Source", f"{len(source_results['comments'])} comments", f"{len(source_results['hidden_fields'])} hidden fields")
+    summary.add_row("Cookies", f"{len(cookie_results['cookies'])} cookies", f"{len(cookie_results['security_issues'])} issues")
+    summary.add_row("SQLi", "VULNERABLE" if sqli_results["vulnerable"] else "Not vulnerable", sqli_results["vuln_type"] or "-")
+    summary.add_row("Directories", f"{len(brute_results)} found", "-")
+    summary.add_row("Subdomains", f"{len(sub_results)} found", "-")
+    console.print(summary)
+
+    if args.json_output:
+        all_results = {
+            "headers": header_results,
+            "source": source_results,
+            "cookies": cookie_results,
+            "sqli": sqli_results,
+            "directories": brute_results,
+            "subdomains": sub_results,
+        }
+        with open(args.json_output, "w") as f:
+            json.dump(all_results, f, indent=2, default=str)
+        console.print(f"\n[green]Results saved to {args.json_output}[/green]")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Web CTF Solver - All-in-One Web Penetration Testing Tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Available Modules:
+  sqli        SQL Injection scanner (error-based, UNION, blind, time-based)
+  xss         XSS scanner (70+ payloads, filter bypass, DOM analysis)
+  brute       Directory/file brute-force (multi-threaded)
+  subdomains  Subdomain enumeration (DNS + crt.sh)
+  headers     Security header analysis + tech detection
+  source      Source code review (comments, hidden fields, API keys)
+  cookies     Cookie analysis + manipulation payloads
+  all         Run all modules against target
+
+Quick Examples:
+  %(prog)s sqli -u "http://target.com/page?id=1"
+  %(prog)s sqli -u "http://target.com/login" -d "user=admin" -d "pass=123" --dump
+  %(prog)s xss -u "http://target.com/search?q=test" -p q
+  %(prog)s xss -u "http://target.com/reflected" -p input --payloads
+  %(prog)s xss -u "http://target.com/reflected" -p input --payloads --filter "alert,parentheses"
+  %(prog)s brute -u "http://target.com" --threads 20
+  %(prog)s brute -u "http://target.com" -e ".php,.html,.txt" --paths "admin,login,flag"
+  %(prog)s subdomains -d target.com --crtsh
+  %(prog)s subdomains -d target.com --dns-only --threads 50
+  %(prog)s headers -u "http://target.com"
+  %(prog)s source -u "http://target.com" -H "Authorization: Bearer token123"
+  %(prog)s cookies -u "http://target.com" --payloads --cookie-name session
+  %(prog)s all -u "http://target.com" --threads 20 -j results.json
+
+With Auth Headers:
+  %(prog)s sqli -u "http://target.com/api?id=1" -H "Authorization: Bearer eyJ..."
+  %(prog)s headers -u "http://target.com/admin" -H "Cookie: admin=true"
+  %(prog)s brute -u "http://target.com" -H "Cookie: session=abc123"
+        """,
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Module to run")
+
+    common_args = argparse.ArgumentParser(add_help=False)
+    common_args.add_argument("-u", "--url", help="Target URL (e.g., http://target.com/page?id=1)")
+    common_args.add_argument("-t", "--timeout", type=int, default=10, help="Request timeout in seconds (default: 10)")
+    common_args.add_argument("-H", "--header", action="append", help="Custom header, repeatable (e.g., -H 'Authorization: Bearer token')")
+    common_args.add_argument("-c", "--cookie", action="append", help="Cookie, repeatable (e.g., -c 'session=abc123')")
+    common_args.add_argument("-j", "--json-output", help="Save results to JSON file (e.g., -j results.json)")
+
+    sqli_parser = subparsers.add_parser("sqli", parents=[common_args], help="SQL Injection scanner", formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""
+SQLi Examples:
+  %(prog)s -u "http://target.com/page?id=1"
+  %(prog)s -u "http://target.com/page?id=1" --dump
+  %(prog)s -u "http://target.com/page?id=1" --exploit "' UNION SELECT NULL,NULL,NULL--"
+  %(prog)s -u "http://target.com/login" -d "user=admin" -d "pass=123" --dump
+  %(prog)s -u "http://target.com/search?q=test" -H "Cookie: auth=abc"
+        """)
+    sqli_parser.add_argument("-d", "--data", action="append", help="POST data, repeatable (e.g., -d 'user=admin')")
+    sqli_parser.add_argument("--dump", action="store_true", help="Attempt to dump database tables/columns/data")
+    sqli_parser.add_argument("--exploit", help="Execute custom SQL payload (e.g., --exploit \"' UNION SELECT NULL,NULL--\")")
+
+    xss_parser = subparsers.add_parser("xss", parents=[common_args], help="XSS scanner", formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""
+XSS Examples:
+  %(prog)s -u "http://target.com/search?q=test" -p q
+  %(prog)s -u "http://target.com/reflected" -p input --payloads
+  %(prog)s -u "http://target.com/reflected" -p input --payloads --filter "alert,parentheses"
+  %(prog)s -u "http://target.com/reflected" -p input --exploit "<script>alert(1)</script>"
+  %(prog)s -u "http://target.com/post" -p comment -d "comment=test" --payloads
+        """)
+    xss_parser.add_argument("-p", "--param", required=True, help="Parameter to test (e.g., -p q)")
+    xss_parser.add_argument("-d", "--data", action="append", help="POST data, repeatable (e.g., -d 'comment=test')")
+    xss_parser.add_argument("--payloads", action="store_true", help="Generate XSS payloads for manual testing")
+    xss_parser.add_argument("--filter", help="Filter rules to bypass (e.g., --filter 'alert,parentheses,script')")
+    xss_parser.add_argument("--exploit", help="Execute custom XSS payload (e.g., --exploit '<script>alert(1)</script>')")
+
+    brute_parser = subparsers.add_parser("brute", parents=[common_args], help="Directory brute-force", formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""
+Brute-Force Examples:
+  %(prog)s -u "http://target.com"
+  %(prog)s -u "http://target.com" --threads 50
+  %(prog)s -u "http://target.com" -e ".php,.html,.txt"
+  %(prog)s -u "http://target.com" --paths "admin,login,flag,secret"
+  %(prog)s -u "http://target.com" -w /usr/share/wordlists/dirb/common.txt
+  %(prog)s -u "http://target.com" -c "session=abc123" -j dirs.json
+        """)
+    brute_parser.add_argument("-w", "--wordlist", help="Custom wordlist path (one path per line)")
+    brute_parser.add_argument("-e", "--extensions", help="Extensions to try (e.g., -e '.php,.html,.txt,.js')")
+    brute_parser.add_argument("--threads", type=int, default=10, help="Number of threads (default: 10)")
+    brute_parser.add_argument("--paths", help="Custom paths to test, comma-separated (e.g., --paths 'admin,login,flag')")
+
+    sub_parser = subparsers.add_parser("subdomains", help="Subdomain enumeration", formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""
+Subdomain Examples:
+  %(prog)s -d target.com
+  %(prog)s -d target.com --crtsh
+  %(prog)s -d target.com --dns-only --threads 50
+  %(prog)s -d target.com -w custom_subdomains.txt --timeout 3
+  %(prog)s -d target.com --crtsh -j subs.json
+        """)
+    sub_parser.add_argument("-d", "--domain", required=True, help="Target domain (e.g., -d target.com)")
+    sub_parser.add_argument("-w", "--wordlist", help="Custom wordlist path (one subdomain per line)")
+    sub_parser.add_argument("--threads", type=int, default=20, help="Number of threads (default: 20)")
+    sub_parser.add_argument("--timeout", type=int, default=5, help="DNS timeout in seconds (default: 5)")
+    sub_parser.add_argument("--dns-only", action="store_true", help="DNS resolution only, skip HTTP checks")
+    sub_parser.add_argument("--crtsh", action="store_true", help="Also query crt.sh for certificate transparency logs")
+    sub_parser.add_argument("-j", "--json-output", help="Save results to JSON file")
+
+    headers_parser = subparsers.add_parser("headers", parents=[common_args], help="Header analysis", formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""
+Header Analysis Examples:
+  %(prog)s -u "http://target.com"
+  %(prog)s -u "http://target.com/admin" -H "Authorization: Bearer eyJhbG..."
+  %(prog)s -u "http://target.com" -H "Cookie: admin=true" -j headers.json
+        """)
+
+    source_parser = subparsers.add_parser("source", parents=[common_args], help="Source code analysis", formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""
+Source Analysis Examples:
+  %(prog)s -u "http://target.com"
+  %(prog)s -u "http://target.com/page" -H "Cookie: session=abc"
+  %(prog)s -u "http://target.com/admin" -c "admin=true" -j source.json
+        """)
+
+    cookies_parser = subparsers.add_parser("cookies", parents=[common_args], help="Cookie analysis", formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""
+Cookie Analysis Examples:
+  %(prog)s -u "http://target.com"
+  %(prog)s -u "http://target.com" --payloads --cookie-name session
+  %(prog)s -u "http://target.com" --manipulate "session=admin"
+  %(prog)s -u "http://target.com" -H "Cookie: token=abc123" -j cookies.json
+        """)
+    cookies_parser.add_argument("--manipulate", help="Set cookie value for testing (e.g., --manipulate 'session=admin')")
+    cookies_parser.add_argument("--payloads", action="store_true", help="Generate cookie manipulation payloads")
+    cookies_parser.add_argument("--cookie-name", help="Cookie name for payload generation (e.g., --cookie-name session)")
+
+    all_parser = subparsers.add_parser("all", parents=[common_args], help="Run all modules", formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""
+Run All Examples:
+  %(prog)s -u "http://target.com"
+  %(prog)s -u "http://target.com" --threads 20 -j results.json
+  %(prog)s -u "http://target.com" -H "Cookie: auth=token" -d "user=admin" --threads 15
+        """)
+    all_parser.add_argument("-d", "--data", action="append", help="POST data, repeatable (e.g., -d 'user=admin')")
+    all_parser.add_argument("--threads", type=int, default=10, help="Number of threads (default: 10)")
+
+    args = parser.parse_args()
+
+    if not args.command:
+        console.print(BANNER)
+        parser.print_help()
+        sys.exit(0)
+
+    console.print(BANNER)
+
+    commands = {
+        "sqli": cmd_sqli,
+        "xss": cmd_xss,
+        "brute": cmd_brute,
+        "subdomains": cmd_subdomains,
+        "headers": cmd_headers,
+        "source": cmd_source,
+        "cookies": cmd_cookies,
+        "all": cmd_all,
+    }
+
+    try:
+        commands[args.command](args)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Scan interrupted by user[/yellow]")
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"\n[red]Error: {e}[/red]")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
