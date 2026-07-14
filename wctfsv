@@ -263,99 +263,174 @@ def cmd_cookies(args):
         console.print(f"\n[green]Results saved to {args.json_output}[/green]")
 
 
+def calculate_overall_risk(all_results: dict) -> dict:
+    risk_scores = {
+        "sqli": {"weight": 30, "score": 0},
+        "xss": {"weight": 20, "score": 0},
+        "headers": {"weight": 15, "score": 0},
+        "source": {"weight": 15, "score": 0},
+        "cookies": {"weight": 10, "score": 0},
+        "brute": {"weight": 10, "score": 0},
+    }
+    risk_map = {"CRITICAL": 100, "HIGH": 75, "MEDIUM": 50, "LOW": 25, "NONE": 0}
+    for module, config in risk_scores.items():
+        if module in all_results:
+            level = all_results[module].get("risk_level", "NONE")
+            config["score"] = risk_map.get(level, 0) * config["weight"] / 100
+    total_score = sum(c["score"] for c in risk_scores.values())
+    max_possible = sum(c["weight"] for c in risk_scores.values())
+    overall_percentage = int((total_score / max_possible) * 100) if max_possible > 0 else 0
+    if overall_percentage >= 75:
+        overall_risk = "CRITICAL"
+    elif overall_percentage >= 50:
+        overall_risk = "HIGH"
+    elif overall_percentage >= 25:
+        overall_risk = "MEDIUM"
+    else:
+        overall_risk = "LOW"
+    return {"overall_risk": overall_risk, "overall_percentage": overall_percentage, "module_scores": risk_scores}
+
+
 def cmd_all(args):
     console.print(BANNER)
     console.print(f"[bold cyan]Running all modules against: {args.url}[/bold cyan]\n")
 
     parsed = urlparse(args.url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
+    all_module_results = {}
 
-    console.print("=" * 60)
-    console.print("[bold]1. Header Analysis[/bold]")
-    console.print("=" * 60)
+    console.print("=" * 70)
+    console.print("[bold]1. Header Security Audit[/bold]")
+    console.print("=" * 70)
     header_analyzer = HeaderAnalyzer(url=args.url, timeout=args.timeout)
     header_results = header_analyzer.analyze()
+    all_module_results["headers"] = header_results
 
-    console.print("\n" + "=" * 60)
+    console.print("\n" + "=" * 70)
     console.print("[bold]2. Source Code Analysis[/bold]")
-    console.print("=" * 60)
+    console.print("=" * 70)
     headers = parse_headers(args.header)
     cookies = parse_cookies(args.cookie)
     source_analyzer = SourceAnalyzer(url=args.url, timeout=args.timeout, headers=headers, cookies=cookies)
     source_results = source_analyzer.analyze()
+    all_module_results["source"] = source_results
 
-    console.print("\n" + "=" * 60)
-    console.print("[bold]3. Cookie Analysis[/bold]")
-    console.print("=" * 60)
+    console.print("\n" + "=" * 70)
+    console.print("[bold]3. Cookie Security Analysis[/bold]")
+    console.print("=" * 70)
     cookie_analyzer = CookieAnalyzer(url=args.url, timeout=args.timeout, headers=headers)
     cookie_results = cookie_analyzer.analyze()
+    all_module_results["cookies"] = cookie_results
 
-    console.print("\n" + "=" * 60)
+    console.print("\n" + "=" * 70)
     console.print("[bold]4. SQL Injection Scan[/bold]")
-    console.print("=" * 60)
+    console.print("=" * 70)
     data = parse_data(args.data)
     method = "POST" if args.data else "GET"
-    sqli_scanner = SQLiScanner(
-        url=args.url,
-        method=method,
-        data=data,
-        headers=headers,
-        cookies=cookies,
-        timeout=args.timeout,
-    )
+    sqli_scanner = SQLiScanner(url=args.url, method=method, data=data, headers=headers, cookies=cookies, timeout=args.timeout)
     sqli_results = sqli_scanner.scan()
+    all_module_results["sqli"] = sqli_results
 
-    console.print("\n" + "=" * 60)
+    console.print("\n" + "=" * 70)
     console.print("[bold]5. Directory Brute-Force[/bold]")
-    console.print("=" * 60)
-    bruter = DirectoryBruter(
-        url=base_url,
-        threads=min(args.threads, 5),
-        timeout=args.timeout,
-        headers=headers,
-        cookies=cookies,
-    )
+    console.print("=" * 70)
+    bruter = DirectoryBruter(url=base_url, threads=min(args.threads, 5), timeout=args.timeout, headers=headers, cookies=cookies)
     brute_results = bruter.scan()
+    all_module_results["brute"] = brute_results
 
-    console.print("\n" + "=" * 60)
+    console.print("\n" + "=" * 70)
     console.print("[bold]6. Subdomain Enumeration[/bold]")
-    console.print("=" * 60)
+    console.print("=" * 70)
     domain = parsed.netloc.split(":")[0]
-    enumerator = SubdomainEnumerator(
-        domain=domain,
-        threads=min(args.threads, 5),
-        timeout=args.timeout,
-    )
+    enumerator = SubdomainEnumerator(domain=domain, threads=min(args.threads, 5), timeout=args.timeout)
     sub_results = enumerator.enumerate(http_check=False)
+    all_module_results["subdomains"] = sub_results
 
-    console.print("\n" + "=" * 60)
-    console.print("[bold]Summary[/bold]")
-    console.print("=" * 60)
+    risk_assessment = calculate_overall_risk(all_module_results)
+    overall = risk_assessment["overall_risk"]
+    overall_pct = risk_assessment["overall_percentage"]
 
-    summary = Table(title="Scan Summary", border_style="cyan")
+    console.print("\n" + "=" * 70)
+    console.print("[bold]COMPREHENSIVE SECURITY ASSESSMENT[/bold]")
+    console.print("=" * 70)
+
+    risk_colors = {"CRITICAL": "bold red", "HIGH": "red", "MEDIUM": "yellow", "LOW": "green"}
+    risk_color = risk_colors.get(overall, "white")
+
+    summary = Table(title="Overall Risk Assessment", border_style="cyan")
     summary.add_column("Module", style="bold")
-    summary.add_column("Status")
-    summary.add_column("Findings")
-    summary.add_row("Headers", f"{len(header_results['missing_headers'])} missing", f"{len(header_results['security_issues'])} issues")
-    summary.add_row("Source", f"{len(source_results['comments'])} comments", f"{len(source_results['hidden_fields'])} hidden fields")
-    summary.add_row("Cookies", f"{len(cookie_results['cookies'])} cookies", f"{len(cookie_results['security_issues'])} issues")
-    summary.add_row("SQLi", "VULNERABLE" if sqli_results["vulnerable"] else "Not vulnerable", sqli_results["vuln_type"] or "-")
-    summary.add_row("Directories", f"{len(brute_results)} found", "-")
-    summary.add_row("Subdomains", f"{len(sub_results)} found", "-")
+    summary.add_column("Risk Level")
+    summary.add_column("Confidence")
+    summary.add_column("Key Findings")
+    modules_data = [
+        ("Headers", header_results, f"{len(header_results.get('security_issues', []))} issues, {header_results.get('compliance_score', 0)}% compliance"),
+        ("Source", source_results, f"{len(source_results.get('high_risk', []))} high-risk, {len(source_results.get('api_keys', []))} secrets"),
+        ("Cookies", cookie_results, f"{len(cookie_results.get('security_issues', []))} issues, {len(cookie_results.get('jwt_tokens', []))} JWTs"),
+        ("SQLi", sqli_results, "VULNERABLE - " + sqli_results.get("vuln_type", "") if sqli_results.get("vulnerable") else "Not vulnerable"),
+        ("Directories", brute_results, f"{len(brute_results.get('found', []))} paths, {len(brute_results.get('sensitive', []))} sensitive"),
+        ("Subdomains", sub_results, f"{len(sub_results.get('found', []))} found, {len(sub_results.get('takeover', []))} takeover"),
+    ]
+    for name, res, finding in modules_data:
+        level = res.get("risk_level", "NONE")
+        color = risk_colors.get(level, "white")
+        conf = res.get("confidence", 0)
+        summary.add_row(name, f"[{color}]{level}[/{color}]", f"{conf}%", finding)
     console.print(summary)
+
+    overall_table = Table(title="OVERALL RISK", border_style="red" if overall in ["CRITICAL", "HIGH"] else "yellow" if overall == "MEDIUM" else "green")
+    overall_table.add_column("Metric", style="bold")
+    overall_table.add_column("Value")
+    overall_table.add_row("Overall Risk Level", f"[{risk_color}]{overall}[/{risk_color}]")
+    overall_table.add_row("Risk Score", f"{overall_pct}%")
+    overall_table.add_row("URL", args.url)
+    overall_table.add_row("Scan Modules", "6/6")
+    console.print(overall_table)
+
+    all_findings = []
+    all_recommendations = []
+    critical_items = []
+    for module, res in all_module_results.items():
+        for f in res.get("findings", []):
+            all_findings.append(f"[{module.upper()}] {f}")
+        for r in res.get("recommendations", []):
+            all_recommendations.append(f"[{module.upper()}] {r}")
+        if res.get("vulnerable") or res.get("risk_level") in ["CRITICAL", "HIGH"]:
+            critical_items.append(f"[{module.upper()}] {res.get('risk_level', 'N/A')} risk")
+
+    if all_findings:
+        console.print("\n[bold]ALL FINDINGS:[/bold]")
+        for f in all_findings:
+            console.print(f"  [cyan]->[/cyan] {f}")
+
+    if critical_items:
+        console.print("\n[bold red]CRITICAL/HIGH ITEMS:[/bold red]")
+        for item in critical_items:
+            console.print(f"  [red]![/red] {item}")
+
+    console.print("\n[bold]RECOMMENDATIONS (Priority Order):[/bold]")
+    seen = set()
+    priority_recs = []
+    for r in all_recommendations:
+        key = r.split("]")[1].strip() if "]" in r else r
+        if key not in seen:
+            seen.add(key)
+            priority_recs.append(r)
+    for i, r in enumerate(priority_recs[:15], 1):
+        console.print(f"  {i}. {r}")
 
     if args.json_output:
         all_results = {
-            "headers": header_results,
-            "source": source_results,
-            "cookies": cookie_results,
-            "sqli": sqli_results,
-            "directories": brute_results,
-            "subdomains": sub_results,
+            "target": args.url,
+            "overall_risk": overall,
+            "overall_risk_percentage": overall_pct,
+            "module_results": all_module_results,
+            "all_findings": all_findings,
+            "all_recommendations": priority_recs,
+            "critical_items": critical_items,
         }
         with open(args.json_output, "w") as f:
             json.dump(all_results, f, indent=2, default=str)
-        console.print(f"\n[green]Results saved to {args.json_output}[/green]")
+        console.print(f"\n[green]Full report saved to {args.json_output}[/green]")
 
 
 def main():
